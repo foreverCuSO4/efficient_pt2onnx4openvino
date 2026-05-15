@@ -48,7 +48,7 @@ def tensor_shape(value_info: onnx.ValueInfoProto) -> list[int | str]:
     ]
 
 
-def find_target_output(graph: onnx.GraphProto, target_node_name: str) -> str:
+def find_target_output(graph: onnx.GraphProto, target_node_name: str) -> str | None:
     for node in graph.node:
         if node.name == target_node_name:
             if not node.output:
@@ -57,13 +57,8 @@ def find_target_output(graph: onnx.GraphProto, target_node_name: str) -> str:
             print(f"   target tensor: {node.output[0]}")
             return node.output[0]
 
-    print(f"   target node {target_node_name!r} not found; using last Transpose node")
-    transposes = [node for node in graph.node if node.op_type == "Transpose"]
-    if not transposes:
-        raise RuntimeError("could not find target node or any Transpose node")
-    target = transposes[-1].output[0]
-    print(f"   fallback target tensor: {target}")
-    return target
+    print(f"   target node {target_node_name!r} not found")
+    return None
 
 
 def infer_output_shape(
@@ -150,6 +145,69 @@ def inject_uint8_nhwc_preprocess(
     graph.node.insert(0, node_cast)
 
 
+def normalize_output_layout(
+    graph: onnx.GraphProto,
+    model_proto: onnx.ModelProto,
+    num_classes: int,
+) -> None:
+    if len(graph.output) != 1:
+        raise RuntimeError(f"expected one graph output, got {len(graph.output)}")
+
+    output = graph.output[0]
+    output_shape = tensor_shape(output)
+    expected_attrs = 4 + num_classes
+
+    if len(output_shape) != 3:
+        print(f"   keeping original output layout: {output.name} {output_shape}")
+        return
+
+    if output_shape[2] == expected_attrs:
+        print(f"   original output is already anchors-last: {output.name} {output_shape}")
+        return
+
+    if output_shape[1] != expected_attrs:
+        print(f"   keeping original output layout: {output.name} {output_shape}")
+        return
+
+    anchors = output_shape[2]
+    if not isinstance(anchors, int) or anchors <= 0:
+        inferred = shape_inference.infer_shapes(model_proto)
+        for info in inferred.graph.output:
+            if info.name == output.name:
+                inferred_shape = tensor_shape(info)
+                if len(inferred_shape) == 3:
+                    anchors = inferred_shape[2]
+                break
+
+    if not isinstance(anchors, int) or anchors <= 0:
+        raise RuntimeError(f"cannot infer anchor dimension for output shape {output_shape}")
+
+    original_output_name = output.name
+    transposed_output_name = "output_anchors_last"
+    node_transpose = helper.make_node(
+        "Transpose",
+        [original_output_name],
+        [transposed_output_name],
+        perm=[0, 2, 1],
+        name="post/Transpose_Output_to_NxAttrs",
+    )
+    graph.node.append(node_transpose)
+
+    while len(graph.output) > 0:
+        graph.output.pop()
+    graph.output.append(
+        helper.make_tensor_value_info(
+            transposed_output_name,
+            TensorProto.FLOAT,
+            [1, anchors, expected_attrs],
+        )
+    )
+    print(
+        "   output transposed to anchors-last: "
+        f"{transposed_output_name} [1, {anchors}, {expected_attrs}]"
+    )
+
+
 def export_base_onnx(
     model_path: Path,
     temp_dir: Path,
@@ -204,23 +262,26 @@ def rewrite_model(
     graph = model_proto.graph
 
     target_output_tensor = find_target_output(graph, target_node_name)
-    inferred_shape = infer_output_shape(
-        model_proto,
-        target_output_tensor,
-        input_shape,
-        num_classes,
-    )
-
-    while len(graph.output) > 0:
-        graph.output.pop()
-    graph.output.append(
-        helper.make_tensor_value_info(
+    if target_output_tensor is not None:
+        inferred_shape = infer_output_shape(
+            model_proto,
             target_output_tensor,
-            TensorProto.FLOAT,
-            inferred_shape,
+            input_shape,
+            num_classes,
         )
-    )
-    print(f"   graph output redirected: {target_output_tensor} {inferred_shape}")
+
+        while len(graph.output) > 0:
+            graph.output.pop()
+        graph.output.append(
+            helper.make_tensor_value_info(
+                target_output_tensor,
+                TensorProto.FLOAT,
+                inferred_shape,
+            )
+        )
+        print(f"   graph output redirected: {target_output_tensor} {inferred_shape}")
+    else:
+        normalize_output_layout(graph, model_proto, num_classes)
 
     inject_uint8_nhwc_preprocess(graph, input_shape, input_name)
     print(f"   graph input: {input_name} [1, {input_shape[0]}, {input_shape[1]}, 3] UINT8")
